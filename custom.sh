@@ -1,81 +1,133 @@
 #!/bin/bash
 
-# Function to display menu and get user choice
-display_menu() {
-    echo "Please select the Windows Server or Windows version:"
-    echo "1. Windows Server 2016"
-    echo "2. Windows Server 2019"
-    echo "3. Windows Server 2022"
-    echo "4. Windows 10"
-    echo "5. Windows 11"
-    read -p "Enter your choice: " choice
-}
-
-# Update package repositories and upgrade existing packages
-apt-get update 
-
-# Install QEMU and its utilities
-apt-get install qemu -y
-apt install qemu-utils -y
-apt install qemu-system-x86-xen -y
-apt install qemu-system-x86 -y
-apt install qemu-kvm -y
-
-echo "QEMU installation completed successfully."
-
-# Get user choice
-display_menu
-
-case $choice in
-    1)
-        # Windows Server 2016
-        img_file="windows2016.img"
-        iso_link="https://go.microsoft.com/fwlink/p/?LinkID=2195174&clcid=0x409&culture=en-us&country=US"
-        iso_file="windows2016.iso"
-        ;;
-    2)
-        # Windows Server 2019
-        img_file="windows2019.img"
-        iso_link="https://go.microsoft.com/fwlink/p/?LinkID=2195167&clcid=0x409&culture=en-us&country=US"
-        iso_file="windows2019.iso"
-        ;;
-    3)
-        # Windows Server 2022
-        img_file="windows2022.img"
-        iso_link="https://go.microsoft.com/fwlink/p/?LinkID=2195280&clcid=0x409&culture=en-us&country=US"
-        iso_file="windows2022.iso"
-        ;;
-    4)
-        # Windows 10
-        img_file="windows10.img"
-        iso_link="http://139.59.225.131/WIN10.ISO"
-        iso_file="windows10.iso"
-        ;;
-    5)
-        # Windows 11
-        img_file="windows11.img"
-        iso_link="http://139.59.225.131/WIN11.ISO"
-        iso_file="windows11.iso"
-        ;;
+export isDebug="no"
+export verbose=""
+export confirm="no"
+POSITIONAL=()
+while [[ $# -ge 1 ]]; do
+  case $1 in
+    -d|--debug)
+      shift
+      isDebug="yes"
+      ;;
+    -y|--yes)
+      shift
+      confirm="yes"
+      ;;
+    -v|--verbose)
+      shift
+      verbose="yes"
+      ;;
     *)
-        echo "Invalid choice. Exiting."
-        exit 1
-        ;;
-esac
+      POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
 
-echo "Selected version: $img_file"
+set -- "${POSITIONAL[@]}"
 
-# Create a raw image file with the chosen name
-qemu-img create -f raw "$img_file" 40G
+if [ "$(id -u)" != "0" ]; then
+    echo "You must be root to execute the script. Exiting."
+    exit 1
+fi
 
-echo "Image file $img_file created successfully."
+# Network Configuration
+IP4=$(curl -4 -s icanhazip.com)
+gateway=$(ip route | awk '/default/ { print $3 }')
+ethernet="Ethernet Instance 0"
 
-# Download Virtio driver ISO
-wget -O virtio-win.iso 'https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.208-1/virtio-win-0.1.208.iso'
+# Create Windows network configuration script
+cat >/tmp/net.bat<<EOF
+@ECHO OFF
+cd.>%windir%\GetAdmin
+if exist %windir%\GetAdmin (del /f /q "%windir%\GetAdmin") else (
+echo CreateObject^("Shell.Application"^).ShellExecute "%~s0", "%*", "", "runas", 1 >> "%temp%\Admin.vbs"
+"%temp%\Admin.vbs"
+del /f /q "%temp%\Admin.vbs"
+exit /b 2)
 
-echo "Virtio driver ISO downloaded successfully."
+netsh -c interface ip set address name="$ethernet" source=static address=$IP4 mask=255.255.240.0 gateway=$gateway
+netsh -c interface ip add dnsservers name="$ethernet" address=1.1.1.1 index=1 validate=no
+netsh -c interface ip add dnsservers name="$ethernet" address=8.8.4.4 index=2 validate=no
 
-# Download Windows ISO with the chosen name
-wget -O "$iso_file" "$iso_link"
+ECHO SELECT VOLUME=%%SystemDrive%% > "%SystemDrive%\diskpart.extend"
+ECHO EXTEND >> "%SystemDrive%\diskpart.extend"
+START /WAIT DISKPART /S "%SystemDrive%\diskpart.extend"
 
-echo "Windows ISO downloaded successfully."
+cd /d "%ProgramData%/Microsoft/Windows/Start Menu/Programs/Startup"
+del "%~f0"
+exit
+EOF
+
+# Setup autoinstall script
+cat >/tmp/autoinstall.sh <<EOF
+#!/bin/bash
+wget --no-check-certificate -O- https://image.yha.my.id/2:/windows10.gz | gunzip | dd of=/dev/vda bs=3M status=progress
+mount.ntfs-3g /dev/vda2 /mnt
+cd "/mnt/ProgramData/Microsoft/Windows/Start Menu/Programs/"
+cd Start* || cd start*
+cp -f /tmp/net.bat net.bat
+poweroff
+EOF
+
+chmod +x /tmp/autoinstall.sh
+
+# Prepare GRUB entry
+GRUBDIR=/boot/grub
+GRUBFILE=grub.cfg
+
+cat >/tmp/grub.new <<EndOfMessage
+menuentry "Windows 10 Installer" {
+  linux /boot/vmlinuz root=/dev/ram0 rw quiet
+  initrd /boot/initrd.img
+  echo 'Loading Windows 10 installer...'
+  linux16 /tmp/autoinstall.sh
+}
+EndOfMessage
+
+if [ ! -f $GRUBDIR/$GRUBFILE ]; then
+  echo "Grub config not found $GRUBDIR/$GRUBFILE."
+  exit 2
+fi
+
+# Show installation info
+echo "Ready to setup Windows 10 installation"
+echo "IP Address: $IP4"
+echo "Gateway: $gateway"
+
+if [ -n "$verbose" ]; then
+  echo "============================================"
+  echo "Debug: $isDebug"
+  echo "Network configuration will be applied automatically after installation"
+  echo "GRUB entry to be added:"
+  cat /tmp/grub.new
+  echo "============================================"
+fi
+
+# Confirmation
+if [ "$confirm" = "no" ]; then
+  echo -n "Setup installation and reboot? (y,n) : "
+  read yesno
+  if [ "$yesno" != "y" ]; then
+    exit 1
+  fi
+fi
+
+# Add GRUB entry and prepare for installation
+cp /tmp/net.bat /boot/
+cp /tmp/autoinstall.sh /boot/
+
+# Modify GRUB
+sed -i '$a\\n' /tmp/grub.new
+INSERTGRUB="$(awk '/menuentry /{print NR}' $GRUBDIR/$GRUBFILE|head -n 1)"
+sed -i ''${INSERTGRUB}'i\\n' $GRUBDIR/$GRUBFILE
+sed -i ''${INSERTGRUB}'r /tmp/grub.new' $GRUBDIR/$GRUBFILE
+
+# Update GRUB to boot to installer by default
+sed -i 's/GRUB_DEFAULT=.*/GRUB_DEFAULT="Windows 10 Installer"/' /etc/default/grub
+update-grub
+
+echo "Installation setup complete. System will reboot to start installation..."
+sleep 3
+reboot
